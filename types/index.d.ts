@@ -58,12 +58,21 @@ export type Theme = {
   selection: string
 }
 
+export type DiffView = {
+  path: string
+  rel: string
+  source: string
+  note: string
+  message: string
+}
+
 declare module 'claude-code' {
   interface PluginState {
     filetree: {
       tree: FileTree
       theme: Theme
       activity: Activity[]
+      diff: DiffView
     }
   }
 }

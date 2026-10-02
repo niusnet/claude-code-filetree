@@ -310,3 +310,39 @@ export function stamp(ms: number): string {
   const p = (v: number) => String(v).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
+
+const WIDE = [
+  [0x1100, 0x115f],
+  [0x2e80, 0xa4cf],
+  [0xac00, 0xd7a3],
+  [0xf900, 0xfaff],
+  [0xfe30, 0xfe6f],
+  [0xff00, 0xff60],
+  [0xffe0, 0xffe6],
+  [0x1f300, 0x1f64f],
+  [0x1f900, 0x1f9ff],
+  [0x20000, 0x3fffd],
+] as const
+
+function cells(ch: string): number {
+  const cp = ch.codePointAt(0) ?? 0
+  return WIDE.some(([lo, hi]) => cp >= lo && cp <= hi) ? 2 : 1
+}
+
+export function cellWidth(text: string): number {
+  let n = 0
+  for (const ch of text) n += cells(ch)
+  return n
+}
+
+export function clip(text: string, cols: number): string {
+  if (cellWidth(text) <= cols) return text
+  let out = ''
+  let used = 0
+  for (const ch of text) {
+    if (used + cells(ch) > cols - 1) break
+    out += ch
+    used += cells(ch)
+  }
+  return out + '…'
+}

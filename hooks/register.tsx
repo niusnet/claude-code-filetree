@@ -1,12 +1,15 @@
 import { type BuiltinToolResults, type EngineInterface, type Register, type Timer, update } from 'claude-code'
 
-import type { Activity, FileNode, FileTree, Theme } from '../types'
+import type { Activity, DiffView, FileNode, FileTree, Theme } from '../types'
+import { DIFF_LIMIT, shapeDiff } from './diff'
 import { BRANCH_ICON, chainOf, type GitAction, gitActions, readOnly, readTargets, resolve, TONES } from './git'
 import type { RowSpec, RowsProps, Seg } from './rows'
 import { CHEVRON_CLOSED, CHEVRON_OPEN, fileIcon, GIT_COLOR } from './icons'
 import {
   ancestorsOf,
+  cellWidth,
   type Change,
+  clip,
   DEFAULT_THEME,
   dirname,
   emptyTree,
@@ -33,12 +36,17 @@ import {
 const TREE = { plugin: 'filetree', key: 'tree' } as const
 const THEME = { plugin: 'filetree', key: 'theme' } as const
 const ACTIVITY = { plugin: 'filetree', key: 'activity' } as const
+const DIFFVIEW = { plugin: 'filetree', key: 'diff' } as const
 const PANE = 'filetree'
+const DIFF = 'filetree-diff'
 const SHIMMER = Object.fromEntries(Object.entries(TONES).map(([k, v]) => [k, { bright: v.bright, dim: v.dim }]))
 const BRANCH_ROW = '#branch'
 const FLASH_MS = 2700
 const RUNNING_MAX_MS = 600_000
 const NO_REPO_DEPTH = 4
+const MIN_NAME = 8
+const BINARY = /^Binary files .* differ$|^GIT binary patch/m
+const STATUS_WORD: Record<string, string> = { M: 'modified', A: 'added', D: 'deleted', R: 'renamed', C: 'copied', T: 'type changed', U: 'conflict', '?': 'untracked' }
 const DOUBLE_MS = 450
 const FIND_LIMIT = 200
 const READ_REVEAL_LIMIT = 12
@@ -77,6 +85,7 @@ let pointer = true
 let view = { from: 0, max: 0 }
 let lastSync = 0
 let noDock = false
+let paneOpen = false
 let home = ''
 let platform: Promise<'linux' | 'darwin' | 'win32'> | null = null
 let dirty: { root: string; files: Record<string, Change> } = { root: '', files: {} }
@@ -97,6 +106,20 @@ function osName($: EngineInterface): Promise<'linux' | 'darwin' | 'win32'> {
     }
   })()
   return platform
+}
+
+async function openPane($: EngineInterface, args: Parameters<EngineInterface['ui']['open']>[0]): Promise<void> {
+  paneOpen = (await $.ui.open(args)).isPlaced
+}
+
+async function closePane($: EngineInterface): Promise<void> {
+  paneOpen = false
+  try {
+    await $.ui.close({ id: PANE })
+  } catch (err) {
+    paneOpen = true
+    throw err
+  }
 }
 
 async function cwdOf($: EngineInterface): Promise<string> {
@@ -256,8 +279,8 @@ async function reset($: EngineInterface, root: string, focus = false): Promise<v
   searchIndex = null
   await put($, () => ({ ...emptyTree(root), showHidden: keepHidden }))
   const title = `Files: ${root.split('/').pop() || root}`
-  if (focus) await $.ui.open({ id: PANE, title, focus: true })
-  else if (!noDock) await $.ui.open({ id: PANE, title })
+  if (focus) await openPane($, { id: PANE, title, focus: true })
+  else if (!noDock) await openPane($, { id: PANE, title })
   await loadDirs($, [root])
   await detectRepo($)
   await refreshGit($)
@@ -785,6 +808,40 @@ async function openFile($: EngineInterface, path: string): Promise<void> {
   }
 }
 
+async function showDiff($: EngineInterface, n: FileNode): Promise<void> {
+  const t = await get($)
+  if (n.kind !== 'file') return void $.ui.toast('Select a file to see its diff')
+  if (!t.top) return void $.ui.toast('Not a git repository: no diff to show')
+  const status = t.git[n.id] ?? (underAny(dirname(n.id), new Set(t.untrackedDirs), t.root) ? '?' : undefined)
+  if (!status) return void $.ui.toast(`${n.name} has no changes`)
+  const rel = relative(t.root, n.id)
+  const flags = ['--no-color', '--no-ext-diff', '--no-textconv']
+  const untracked = status === '?'
+  const view: DiffView = { path: n.id, rel: printable(rel), source: '', note: STATUS_WORD[status] ?? status, message: '' }
+  try {
+    let run = await git($, t.root, untracked ? ['diff', '--no-index', ...flags, '--', '/dev/null', rel] : ['diff', 'HEAD', ...flags, '--', rel])
+    if (!untracked && run.exitCode !== 0) run = await git($, t.root, ['diff', '--cached', ...flags, '--', rel])
+    if (run.exitCode !== 0 && !(untracked && run.exitCode === 1)) view.message = `git diff failed: ${run.stderr.trim().split('\n')[0] || `exit ${run.exitCode}`}`
+    else {
+      const shaped = shapeDiff(run.stdout)
+      if (shaped) {
+        view.source = shaped.source
+        const more = [shaped.omitted ? `${shaped.omitted} more diff lines not shown (limit ${DIFF_LIMIT} characters)` : '', run.isStdoutTruncated ? 'git output was cut' : ''].filter(Boolean)
+        view.note = [view.note, ...more].join(' - ')
+      } else view.message = BINARY.test(run.stdout) ? 'Binary file: there is no text diff to show.' : 'No textual changes to show (the file may only have a mode change).'
+    }
+  } catch (err) {
+    view.message = `could not run git: ${err instanceof Error ? err.message : String(err)}`
+  }
+  await $.state.set(DIFFVIEW, view)
+  await $.ui.open({ id: DIFF, title: `Diff: ${printable(n.name)}`, focus: true, closeOnEscape: true })
+}
+
+/** A file name with its control characters (legal in names, refused in titles and Text) shown as `?`. */
+function printable(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, '?')
+}
+
 async function toggle($: EngineInterface, n: FileNode): Promise<void> {
   if (n.kind === 'dir' && !(await get($)).expanded.includes(n.id)) await loadDirs($, [n.id])
   await patch($, t => {
@@ -849,7 +906,7 @@ export const register: Register = (on, options) => {
       await setActivities($, cur => cur.map(a => (a.state === 'running' ? { ...a, state: 'failed', label: `${a.kind} interrupted` } : a)))
       const cwd = await cwdOf($)
       if (!t.root || t.nodes.length === 0 || (follow && t.root !== cwd)) await reset($, cwd)
-      else if (!noDock) await $.ui.open({ id: PANE, title: `Files: ${t.root.split('/').pop() || t.root}` })
+      else if (!noDock) await openPane($, { id: PANE, title: `Files: ${t.root.split('/').pop() || t.root}` })
     })()
     return next(e)
   })
@@ -859,11 +916,26 @@ export const register: Register = (on, options) => {
     if (e.presentation.columns < 110) return { text: 'filetree shows in the sidebar, which needs a terminal at least 110 columns wide. Widen it, then run /filetree.' }
     noDock = false
     const arg = (e.args ?? '').trim()
+    if (!arg && paneOpen) {
+      await closePane($)
+      return { text: 'File tree closed.' }
+    }
     const cwd = await cwdOf($)
     follow = !arg
     const root = arg ? resolve(cwd, arg, home) : cwd
     await reset($, root, true)
     return { text: `File tree on ${shortPath(root)}${follow ? ' (follows the cwd)' : ''}.` }
+  })
+
+  on('ui.close', async ($, e, next) => {
+    const was = paneOpen
+    if (e.id === PANE) paneOpen = false
+    try {
+      return await next(e)
+    } catch (err) {
+      if (e.id === PANE) paneOpen = was
+      throw err
+    }
   })
 
   on('tool.call', async ($, e, next) => {
@@ -925,7 +997,7 @@ export const register: Register = (on, options) => {
 
   on('ui.message', async ($, e, next) => {
     if (e.requestId !== PANE || e.element !== 'rows' || !e.data || typeof e.data !== 'object') return next(e)
-    const data = e.data as { press?: unknown; key?: unknown; ctrl?: unknown; shift?: unknown; scrollTo?: unknown; copy?: unknown }
+    const data = e.data as { press?: unknown; key?: unknown; ctrl?: unknown; shift?: unknown; scrollTo?: unknown; copy?: unknown; diff?: unknown }
     void sync($)
     const t = await get($)
     if (typeof data.copy === 'string') {
@@ -935,6 +1007,11 @@ export const register: Register = (on, options) => {
     if (typeof data.scrollTo === 'number') {
       const to = Math.round(Math.max(0, Math.min(1, data.scrollTo)) * view.max)
       if (to !== t.scroll) await patch($, () => ({ scroll: to }))
+      return {}
+    }
+    if (typeof data.diff === 'string') {
+      const n = t.nodes.find(x => x.id === data.diff)
+      if (n) await showDiff($, n)
       return {}
     }
     if (typeof data.press === 'string') {
@@ -966,6 +1043,7 @@ export const register: Register = (on, options) => {
       else if (cur.parent !== t.root) await patch($, () => ({ cursor: cur.parent }))
     } else if (cur && data.key === 'return') await (cur.kind !== 'dir' ? openNode($, cur) : toggle($, cur))
     else if (cur && data.key === ' ') await toggle($, cur)
+    else if (cur && data.key === 'd') await showDiff($, cur)
     return {}
   })
 
@@ -1041,6 +1119,27 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  on('ui.render', { component: 'Pane', requestId: DIFF }, async ($, e, next) => {
+    if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
+    const { Box, Text, Button, Code } = $.ui.resolve(e)
+    const view = (await $.state.get(DIFFVIEW)).value
+    const theme: Theme = (await $.state.get(THEME)).value ?? DEFAULT_THEME
+    return (
+      <Box flexDirection="column" minHeight={Math.max(1, e.props.scroll?.bodyRows ?? 1)}>
+        <Box flexDirection="row">
+          <Button key="close" plain dimColor hotkey="x" label="close" onPress={() => void $.ui.close({ id: DIFF })} />
+          <Box flexShrink={1} marginLeft={2}>
+            <Text bold color={theme.accent} wrap="truncate-start">
+              {view?.rel ?? ''}
+            </Text>
+          </Box>
+        </Box>
+        {view?.note ? <Text color={theme.muted}>{view.note}</Text> : null}
+        {view?.source ? <Code key="diff" source={view.source} format="diff" path={view.rel} /> : <Text color={theme.muted}>{view?.message || 'No file selected.'}</Text>}
+      </Box>
+    )
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
     if (e.surface === 'terminal' && e.props.placement === 'inline') {
@@ -1060,9 +1159,9 @@ export const register: Register = (on, options) => {
     const dimmed = new Set(t.flashOn ? t.flashDim : [])
     const ignored = new Set(t.ignored)
     const untracked = new Set(t.untrackedDirs)
-    const width = Math.max(24, e.props.bodyColumns)
+    const width = Math.max(12, e.props.bodyColumns)
     const rows = visibleRows(t)
-    const fixed = 2 + (t.top ? (t.branch ? 1 : 0) : 1) + (t.selected || latest ? 1 : 0)
+    const fixed = 2 + (t.top ? (t.branch ? 1 : 0) : 1) + 1
     const room = Math.max(5, (e.props.scroll?.bodyRows ?? 40) - fixed)
     const isLit = (id: string) => bright.has(id) || dimmed.has(id)
     const focus = t.flashOn ? ([...t.flash].reverse().find(id => id !== BRANCH_ROW) ?? t.cursor) : t.cursor
@@ -1083,6 +1182,7 @@ export const register: Register = (on, options) => {
     }
     view = { from, max }
     const shown = rows.slice(from, from + room - pinned.length)
+    const hasBar = rows.length > shown.length + pinned.length
     const totals: [number, number] = t.top ? (t.diff[t.root] ?? [0, 0]) : [0, 0]
     const countSegs = (c: [number, number, number] | undefined): Seg[] => {
       if (!c) return []
@@ -1099,6 +1199,7 @@ export const register: Register = (on, options) => {
       const n = r.node
       const own = t.git[n.id]
       const status = own ?? (underAny(dirname(n.id), untracked, t.root) ? '?' : undefined)
+      const changed = n.kind === 'file' && Boolean(status)
       const isIgnored = !status && underAny(n.id, ignored, t.root)
       const gitColor = status === 'D' || status === 'U' ? theme.urgent : status ? (GIT_COLOR[status] ?? theme.muted) : undefined
       const isBright = bright.has(n.id)
@@ -1110,10 +1211,16 @@ export const register: Register = (on, options) => {
       const meta = loc ? '' : n.kind === 'file' ? stamp(n.mtime) : ''
       const locText = loc ? `${loc[0] ? ` +${loc[0]}` : ''}${loc[1] ? ` -${loc[1]}` : ''}` : ''
       const dirCounts = n.kind === 'dir' ? countSegs(t.counts[n.id]) : []
-      const badge = dirCounts.length ? '' : status ? ` ${status}` : isIgnored ? (unicode ? ' ⊘' : ' \u{f05e}') : '  '
+      const badge = dirCounts.length ? '' : status ? ` ${status}` : isIgnored ? (unicode ? ' ⊘' : ' \u{f05e} ') : '  '
       const countsText = dirCounts.map(c => c.t).join('')
-      const cols = Math.max(4, width - r.depth * 2 - 6 - (meta ? meta.length + 1 : 0) - locText.length - badge.length - countsText.length)
-      const name = n.name.length > cols ? n.name.slice(0, cols - 1) + '…' : n.name
+      const space = width - (hasBar ? 1 : 0) - r.depth * 2 - 4 - badge.length
+      const keep = Math.min(cellWidth(n.name), MIN_NAME)
+      const metaCost = meta ? meta.length + 1 : 0
+      const statCost = locText.length + countsText.length
+      const showMeta = metaCost > 0 && space - metaCost - statCost >= keep
+      const showStat = statCost > 0 && space - statCost >= keep
+      const cols = Math.max(1, space - (showMeta ? metaCost : 0) - (showStat ? statCost : 0))
+      const name = clip(n.name, cols)
       const caret = n.kind === 'dir' ? (unicode ? (r.open ? '▾' : '▸') : r.open ? CHEVRON_OPEN : CHEVRON_CLOSED) + ' ' : '  '
       const isRepo = n.kind === 'dir' && n.id === t.top
       const glyph = unicode ? (n.kind === 'dir' ? '■' : '·') : fileIcon(n, r.open, isRepo)
@@ -1125,11 +1232,13 @@ export const register: Register = (on, options) => {
         lit ? { t: name, sh: tone, dim: isDim, b: isBright } : { t: name, c: nameColor, b: n.id === t.selected, s: status === 'D' && n.kind !== 'dir' },
       ]
       const right: Seg[] = []
-      if (meta) right.push({ t: ` ${meta}`, c: theme.muted })
-      if (loc && loc[0] > 0) right.push({ t: ` +${loc[0]}`, c: ADD_COLOR })
-      if (loc && loc[1] > 0) right.push({ t: ` -${loc[1]}`, c: DEL_COLOR })
-      right.push(...dirCounts)
-      if (badge) right.push({ t: badge, c: status ? gitColor : theme.muted, b: true })
+      if (showMeta) right.push({ t: ` ${meta}`, c: theme.muted })
+      if (showStat) {
+        if (loc && loc[0] > 0) right.push({ t: ` +${loc[0]}`, c: ADD_COLOR, ...(changed ? { diff: true } : {}) })
+        if (loc && loc[1] > 0) right.push({ t: ` -${loc[1]}`, c: DEL_COLOR, ...(changed ? { diff: true } : {}) })
+        right.push(...dirCounts)
+      }
+      if (badge) right.push({ t: badge, c: status ? gitColor : theme.muted, b: true, ...(changed ? { diff: true } : {}) })
       return { id: n.id, left: clean(left), right: clean(right) }
     }
 
@@ -1276,6 +1385,7 @@ export const register: Register = (on, options) => {
             />
           </Box>
           {t.query ? <Button key="clear" plain dimColor label={unicode ? '×' : '\u{f0156}'} onPress={() => void search($, '')} /> : null}
+          {t.query ? <Text> </Text> : null}
         </Box>
         <Client
           key="rows"
@@ -1283,19 +1393,18 @@ export const register: Register = (on, options) => {
           props={{ rows: specs, active: t.cursor, activeBg: theme.selection, hoverBg: lighten(theme.selection), tones: SHIMMER, pointer, ...(bar ? { bar } : {}) } satisfies RowsProps}
         />
         <Box flexGrow={1} />
-        {(t.selected || latest) && (
-          <Box flexDirection="row">
-            {t.selected ? (
-              <Box flexShrink={1}>
-                <Text dimColor wrap="truncate-start">
-                  selected: {t.selected !== t.root && inside(t.root, t.selected) ? t.selected.slice(t.root.endsWith('/') ? t.root.length : t.root.length + 1) : shortPath(t.selected)}
-                </Text>
-              </Box>
-            ) : null}
-            <Box flexGrow={1} />
-            {latest && chip(latest)}
-          </Box>
-        )}
+        <Box flexDirection="row">
+          <Button key="close" plain dimColor hotkey="x" label="close" onPress={() => void closePane($)} />
+          {t.selected ? (
+            <Box flexShrink={1} marginLeft={2}>
+              <Text dimColor wrap="truncate-start">
+                selected: {t.selected !== t.root && inside(t.root, t.selected) ? t.selected.slice(t.root.endsWith('/') ? t.root.length : t.root.length + 1) : shortPath(t.selected)}
+              </Text>
+            </Box>
+          ) : null}
+          <Box flexGrow={1} />
+          {latest && chip(latest)}
+        </Box>
       </Box>
     )
   })

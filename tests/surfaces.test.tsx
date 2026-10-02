@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { ancestorsOf, replaceChildren, toNodes } from '../hooks/tree'
+import { DIFF_LIMIT, shapeDiff } from '../hooks/diff'
+import { ancestorsOf, cellWidth, clip, replaceChildren, toNodes } from '../hooks/tree'
 
 type World = {
   os: 'darwin' | 'linux' | 'win32'
@@ -16,6 +17,7 @@ type World = {
   heads?: string[]
   tool?: (e: any) => unknown
   find?: string
+  patch?: (argv: string[]) => { exitCode: number; stdout: string; stderr?: string } | undefined
 }
 type Ran = string[][]
 const opens: unknown[] = []
@@ -76,6 +78,10 @@ function world(on: any, w: World, ran: Ran) {
       if (verb === 'rev-parse' && argv.at(-1) === 'HEAD') return ok(`${(w.heads && w.heads.length > 1 ? w.heads.shift() : w.heads?.[0]) ?? ''}\n`)
       if (verb === 'rev-parse') return w.top ? ok(`\n${w.top}\n`) : { value: { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false } }
       if (verb === 'status') return ok(w.status)
+      if (verb === 'diff' && argv.includes('--no-color')) {
+        const out = w.patch?.(argv)
+        return { value: { exitCode: out?.exitCode ?? 0, stdout: out?.stdout ?? '', stderr: out?.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
       if (verb === 'diff') return ok(w.numstat)
       if (verb === 'ls-files') {
         const files: string[] = []
@@ -347,7 +353,7 @@ test('sidebar only: no pane in the default layout, and an inline pane closes its
   const closed: unknown[] = []
   on('ui.close', (_$: any, e: any) => {
     closed.push(e)
-    return {}
+    return { value: undefined }
   })
   await $.session.start({ cwd: root, surface: 'terminal', isInteractive: true })
   await clock.settle()
@@ -616,5 +622,250 @@ test('a written file whose name holds a newline still shimmers', { timeoutMs: 20
   await clock.settle()
   expect(ran.find(a => a[0] === 'find')).toContain('-print0')
   expect(await texts(ui)).toContain(shimmer('a\nb.ts', 'orange'))
+  await ui.unmount()
+})
+
+test('/filetree toggles: closes the open pane, reopens it, and a path always retargets', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const root = '/home/k/proj'
+  const clock = world(on, { os: 'linux', env: { HOME: '/home/k' }, cwd: root, top: '', dirs: { [root]: [['a.ts', 'file'], ['sub', 'dir']], [`${root}/sub`]: [['b.ts', 'file']] }, status: '', numstat: '' }, ran)
+  const closed: any[] = []
+  on('ui.close', (_$: any, e: any) => {
+    closed.push(e)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: root, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const opened = opens.length
+  const gone = await $.command.run(fullscreen(''))
+  await clock.settle()
+  expect(JSON.stringify(gone)).toContain('File tree closed.')
+  expect(closed.map(c => c.id)).toEqual(['filetree'])
+  expect(opens.length).toBe(opened)
+  const back = await $.command.run(fullscreen(''))
+  await clock.settle()
+  expect(JSON.stringify(back)).toContain('File tree on ~/proj')
+  expect(opens.length).toBe(opened + 1)
+  await $.command.run(fullscreen(`${root}/sub`))
+  await clock.settle()
+  expect(closed.length).toBe(1)
+  expect(opens.length).toBe(opened + 2)
+  const ui = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree', props: paneProps(60) })
+  await ui.press({ key: 'close' })
+  await clock.settle()
+  expect(closed.length).toBe(2)
+  const again = await $.command.run(fullscreen(''))
+  await clock.settle()
+  expect(JSON.stringify(again)).toContain('File tree on')
+  expect(closed.length).toBe(2)
+  expect(opens.length).toBe(opened + 3)
+  await ui.unmount()
+})
+
+test('the pane has its own close control, away from the top right', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const root = '/home/k/proj'
+  const clock = world(on, { os: 'linux', env: { HOME: '/home/k' }, cwd: root, top: '', dirs: { [root]: [['a.ts', 'file']] }, status: '', numstat: '' }, ran)
+  const closed: any[] = []
+  on('ui.close', (_$: any, e: any) => {
+    closed.push(e)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: root, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree', props: paneProps(60) })
+  await clock.settle()
+  const tree = (await ui.drawn()) as any
+  const last = tree.children.at(-1)
+  expect(JSON.stringify(last)).toContain('"key":"close"')
+  expect(JSON.stringify(tree.children[0])).not.toContain('"key":"close"')
+  expect(await ui.find({ key: 'close' })).toBeDefined()
+  await ui.press({ key: 'close' })
+  await clock.settle()
+  expect(closed.map(c => c.id)).toEqual(['filetree'])
+  await ui.unmount()
+})
+
+const drawnCells = (segs: { t: string }[]) => segs.reduce((n, seg) => n + cellWidth(seg.t), 0)
+
+test('narrow pane: no row is wider than the pane and no wide glyph sits in the last cell', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const root = '/home/k/proj'
+  const names = Array.from({ length: 30 }, (_, i) => [`file-with-a-long-name-${i}.ts`, 'file'] as [string, 'file'])
+  const clock = world(on, {
+    os: 'linux', env: { HOME: '/home/k', SSH_CONNECTION: '1 2 3 4' }, cwd: root, top: root,
+    dirs: { [root]: [['sub', 'dir'], ['debug.log', 'file'], ['Defaults.json', 'file'], ...names], [`${root}/sub`]: [['x.ts', 'file']] },
+    status: '## main\0 M Defaults.json\0!! debug.log\0 M file-with-a-long-name-3.ts\0', numstat: '5\t2\tDefaults.json\0',
+  }, ran)
+  await $.session.start({ cwd: root, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  for (const columns of [30, 14]) {
+    const props = { ...paneProps(columns), scroll: { offset: 0, bodyRows: 12 } }
+    const ui = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree', props })
+    await clock.settle()
+    const p = ((await ui.drawn()) as any).children.find((c: any) => c.type === 'Client').props.props
+    expect(p.bar).toBeDefined()
+    expect(JSON.stringify(p.rows)).toContain('debug.log')
+    expect(JSON.stringify(p.rows)).toContain('\uf05e')
+    for (const row of p.rows as { id: string; left: { t: string }[]; right: { t: string }[] }[]) {
+      const last = [...row.left, ...row.right].filter(seg => seg.t).at(-1)?.t ?? ''
+      expect(NERD.test([...last].at(-1) ?? '')).toBe(false)
+      if (row.id) expect(drawnCells(row.left) + drawnCells(row.right)).toBeLessThanOrEqual(Math.max(columns, 12) - 1)
+    }
+    await ui.unmount()
+  }
+})
+
+test('names are cut by terminal cells, wide characters count twice', () => {
+  expect(cellWidth('abc')).toBe(3)
+  expect(cellWidth('日本語')).toBe(6)
+  expect(clip('abcdef', 4)).toBe('abc…')
+  expect(clip('日本語', 5)).toBe('日本…')
+  expect(clip('abc', 3)).toBe('abc')
+})
+
+const PATCH = 'diff --git a/src/a.ts b/src/a.ts\nindex 1111111..2222222 100644\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,3 +1,4 @@ function a()\n one\n-two\n+two!\n+three\n four\n'
+
+test('a diff is cut to the first hunk header and kept whole when it fits', () => {
+  const shaped = shapeDiff(PATCH)
+  expect(shaped?.source.startsWith('@@ -1,3 +1,4 @@ function a()\n')).toBe(true)
+  expect(shaped?.source).not.toContain('diff --git')
+  expect(shaped?.omitted).toBe(0)
+  expect(shapeDiff('Binary files a/x and b/x differ\n')).toBeNull()
+  expect(shapeDiff('')).toBeNull()
+  expect(shapeDiff('@@ -1 +1 @@\n-a\r\n+b\u001b[0m\n')?.source).toBe('@@ -1 +1 @@\n-a\n+b[0m\n')
+})
+
+test('a long diff keeps whole hunks, and a single huge hunk is cut with its counts rewritten', () => {
+  const hunk = (at: number, n: number) => `@@ -${at},${n} +${at},${n} @@\n${Array.from({ length: n }, (_, i) => ` line ${at + i} ${'x'.repeat(40)}`).join('\n')}\n`
+  const many = shapeDiff(hunk(1, 100) + hunk(500, 100) + hunk(900, 100))
+  expect(many?.source.length).toBeLessThanOrEqual(DIFF_LIMIT)
+  expect(many?.source.match(/^@@/gm)?.length).toBe(2)
+  expect(many?.omitted).toBeGreaterThan(0)
+  const huge = shapeDiff(hunk(1, 1000))
+  expect(huge?.source.length).toBeLessThanOrEqual(DIFF_LIMIT)
+  const [header = '', ...body] = (huge?.source ?? '').split('\n').filter(Boolean)
+  expect(header).toBe(`@@ -1,${body.length} +1,${body.length} @@`)
+  expect(huge?.omitted).toBe(1000 - body.length)
+})
+
+test('a cut hunk never ends past the limit, even when its rewritten counts are longer than the estimate', () => {
+  const hunk = `@@ -10000,900 +10000,900 @@\n${Array.from({ length: 900 }, (_, i) => `+${'y'.repeat(i % 13)}`).join('\n')}\n`
+  for (let limit = 60; limit < 700; limit += 7) {
+    const shaped = shapeDiff(hunk, limit)
+    expect((shaped?.source ?? '').length).toBeLessThanOrEqual(limit)
+  }
+})
+
+test('C1 control characters are stripped from the diff too', () => {
+  expect(shapeDiff('@@ -1 +1 @@\n-a\n+b\u0085c\u009b\n')?.source).toBe('@@ -1 +1 @@\n-a\n+bc\n')
+})
+
+const changedWorld = (on0: any, ran: Ran, over: Partial<World> = {}) => {
+  const root = '/home/k/proj'
+  const patches: string[][] = []
+  const clock = world(on0, {
+    os: 'linux', env: { HOME: '/home/k' }, cwd: root, top: root,
+    dirs: { [root]: [['src', 'dir'], ['clean.ts', 'file'], ['new.ts', 'file'], ['logo.png', 'file']], [`${root}/src`]: [['a.ts', 'file']] },
+    status: '## main\0 M src/a.ts\0?? new.ts\0 M logo.png\0', numstat: '2\t1\tsrc/a.ts\0',
+    patch: argv => {
+      patches.push(argv)
+      return argv.includes('--no-index') ? { exitCode: 1, stdout: 'diff --git a/new.ts b/new.ts\n--- /dev/null\n+++ b/new.ts\n@@ -0,0 +1,2 @@\n+hello\n+world\n' } : argv.includes('logo.png') ? { exitCode: 0, stdout: 'diff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n' } : { exitCode: 0, stdout: PATCH }
+    },
+    ...over,
+  }, ran)
+  return { root, patches, clock }
+}
+test('pressing the diff action of a changed file opens its git diff in a second pane', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const { root, patches, clock } = changedWorld(on, ran)
+  const closed: any[] = []
+  on('ui.close', (_$: any, e: any) => {
+    closed.push(e)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: root, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree', props: paneProps(60) })
+  await clock.settle()
+  await ui.post({ press: `${root}/src` }, { in: 'rows' })
+  await clock.settle()
+  const rows = ((await ui.drawn()) as any).children.find((c: any) => c.type === 'Client').props.props.rows
+  const row = rows.find((r: any) => r.id === `${root}/src/a.ts`)
+  expect(row.right.some((s: any) => s.diff === true)).toBe(true)
+  expect(rows.find((r: any) => r.id === `${root}/clean.ts`).right.some((s: any) => s.diff)).toBe(false)
+  const before = opens.length
+  await ui.post({ diff: `${root}/src/a.ts` }, { in: 'rows' })
+  await clock.settle()
+  expect(opens.slice(before)).toEqual([{ id: 'filetree-diff', title: 'Diff: a.ts', focus: true, closeOnEscape: true }])
+  expect(patches.at(-1)).toContain('HEAD')
+  expect(patches.at(-1)?.at(-1)).toBe('src/a.ts')
+  const view = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree-diff', props: paneProps(60) })
+  await clock.settle()
+  const code = await view.find({ type: 'Code' })
+  expect((code as any).props).toMatchObject({ format: 'diff', path: 'src/a.ts' })
+  expect((code as any).props.source.startsWith('@@ -1,3 +1,4 @@')).toBe(true)
+  await view.press({ key: 'close' })
+  await clock.settle()
+  expect(closed.map(c => c.id)).toEqual(['filetree-diff'])
+  await view.unmount()
+  await ui.unmount()
+})
+
+test('the d key shows the diff of an untracked file; clean, binary and empty diffs say so instead', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const { root, patches, clock } = changedWorld(on, ran)
+  await $.session.start({ cwd: root, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree', props: paneProps(60) })
+  const view = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree-diff', props: paneProps(60) })
+  await clock.settle()
+  const show = async (name: string) => {
+    await ui.post({ press: `${root}/${name}` }, { in: 'rows' })
+    await ui.post({ key: 'd' }, { in: 'rows' })
+    await clock.settle()
+  }
+  await show('new.ts')
+  expect(patches.at(-1)).toEqual(expect.arrayContaining(['--no-index', '/dev/null', 'new.ts']))
+  expect(((await view.find({ type: 'Code' })) as any).props.source).toBe('@@ -0,0 +1,2 @@\n+hello\n+world\n')
+  await show('logo.png')
+  expect(await view.find({ type: 'Code' })).toBeUndefined()
+  expect(JSON.stringify(await view.drawn())).toContain('Binary file')
+  const calls = patches.length
+  const before = opens.length
+  await show('clean.ts')
+  expect(patches.length).toBe(calls)
+  expect(opens.length).toBe(before)
+  expect(ran.some(a => a[0] === 'toast' && (a[1] ?? '').includes('clean.ts has no changes'))).toBe(true)
+  await view.unmount()
+  await ui.unmount()
+})
+
+test('diff errors, empty diffs and very long diffs are told, not hidden', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  let mode = 'empty'
+  const big = '@@ -1,900 +1,900 @@\n' + Array.from({ length: 900 }, (_, i) => `-old line ${i} ${'y'.repeat(30)}`).join('\n') + '\n'
+  const { root, clock } = changedWorld(on, ran, {
+    patch: () => (mode === 'empty' ? { exitCode: 0, stdout: '' } : mode === 'fail' ? { exitCode: 128, stdout: '', stderr: 'fatal: bad revision\nmore' } : { exitCode: 0, stdout: big }),
+  })
+  await $.session.start({ cwd: root, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree', props: paneProps(60) })
+  const view = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree-diff', props: paneProps(60) })
+  await clock.settle()
+  await ui.post({ press: `${root}/src` }, { in: 'rows' })
+  const show = async () => {
+    await ui.post({ diff: `${root}/new.ts` }, { in: 'rows' })
+    await clock.settle()
+    return JSON.stringify(await view.drawn())
+  }
+  expect(await show()).toContain('No textual changes')
+  mode = 'fail'
+  expect(await show()).toContain('git diff failed: fatal: bad revision')
+  mode = 'big'
+  const shown = await show()
+  expect(shown).toContain('more diff lines not shown')
+  expect(((await view.find({ type: 'Code' })) as any).props.source.length).toBeLessThanOrEqual(DIFF_LIMIT)
+  await view.unmount()
   await ui.unmount()
 })

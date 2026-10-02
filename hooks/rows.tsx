@@ -1,6 +1,6 @@
 import type { ClientModule } from 'claude-code'
 
-export type Seg = { t: string; c?: string; b?: boolean; s?: boolean; i?: boolean; sh?: string; dim?: boolean; one?: boolean; spin?: boolean; bg?: string; tab?: string }
+export type Seg = { t: string; c?: string; b?: boolean; s?: boolean; i?: boolean; sh?: string; dim?: boolean; one?: boolean; spin?: boolean; bg?: string; tab?: string; diff?: boolean }
 export type RowSpec = { id: string; left: Seg[]; right: Seg[] }
 export type RowsProps = {
   rows: RowSpec[]
@@ -77,6 +77,15 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
         return
       }
       x += w
+    }
+    let rx = surface.columns - (props.bar ? 1 : 0) - row.right.reduce((n, seg) => n + [...seg.t].length, 0)
+    for (const seg of row.right) {
+      const w = [...seg.t].length
+      if (seg.diff && e.x >= rx && e.x < rx + w) {
+        surface.post({ diff: row.id })
+        return
+      }
+      rx += w
     }
     if (row.id) surface.post({ press: row.id, ctrl: Boolean(e.ctrl), shift: Boolean(e.shift) })
   })

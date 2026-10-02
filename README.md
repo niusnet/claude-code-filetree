@@ -80,6 +80,15 @@ Both settings are in `/config` under filetree.
 - **Claude activity:** what shimmers: `reads and writes` (default), `writes`, `reads` or `none`. Git status, line counts and the git status at the bottom always show.
 - **Glyphs:** `auto` (default) uses Nerd Font icons when a Nerd Font is installed and your terminal started after it was installed, plain Unicode in the desktop app, and Nerd Font over SSH. `nerd` or `plain` forces one.
 
+## Fork changes
+
+This fork (niusnet/claude-code-filetree) adds four things on top of upstream.
+
+- **`/filetree` toggles.** With no path, `/filetree` closes the pane when it is open ("File tree closed.") and opens it when it is not. A path (`/filetree ~/src`) always opens or retargets the pane. Closing it with the engine's own close mark or Esc is tracked too, so the next `/filetree` opens it again.
+- **Own close control.** The engine draws a close mark at the top right of every pane and a plugin cannot move or hide it. The tree now has its own `x: close` button in the bottom row, on the left. Press it with the mouse or with `x` while the pane has the keys (typing in the search box types the letter instead).
+- **No more clipped glyphs in narrow panes.** The row width math assumed a 24 column minimum and always reserved the modified time, so in a narrow dock the right-hand columns were pushed past the pane edge and the last glyph (the Nerd Font "ignored" icon) was cut in half. Rows now fit the real pane width: names shrink first (never below 8 cells), then the modified time and line counts are dropped, the git status letter stays, and the Nerd Font ignored icon keeps a blank cell after it. Wide characters in names (CJK, emoji) are counted as two cells.
+- **Diff on demand.** Select a file git reports as modified, added, deleted or untracked and press `d`, or click its `+N -N` counts or its status letter on the right of the row. A second pane (`Diff: <file>`) shows `git diff HEAD -- <file>` (`git diff --no-index /dev/null <file>` for untracked files) drawn with the engine's diff highlighter. Plain clicks and double-clicks keep their meaning (select, open with the default app). Close it with `x`, its `close` button or Esc. Diffs are cut at 10000 characters (whole hunks, with a note of how many lines were left out); binary files, empty diffs, files without changes, folders and folders outside a repository say so instead of opening an empty pane.
+
 ## herdr
 
 Clicking rows needs herdr 0.9.1 or later. herdr 0.9.0 and older accept pixel mouse reporting but still send cell positions, which would put every click in the session in the wrong place, so on those versions the rows ignore the mouse and the rest of the pane and session keep working. Run `herdr update` to get row clicks.
